@@ -256,18 +256,3 @@ so only the most recent logs are kept. Files currently being written are never d
 **Production next steps:** ship the JSON logs to a log platform (ELK / Datadog / CloudWatch), put alerts on
 error rate, p95 latency and ungrounded rate, use an LLM-tracing tool (Langfuse, LangSmith, Helicone or OpenTelemetry GenAI spans)
 for per-step traces, run an LLM-as-judge on a daily sample of interactions, and turn 👎 turns into new eval scenarios.
-
-## Limitations & next steps
-
-- **Rate limiting** is implemented but currently not mounted; re-enable it, and add per-session token budgets and auth on `/api/metrics`.
-- **Conversation history** is sent by the browser each turn; loading it server-side from MongoDB by session would stop forged turns.
-- **Evaluation:** checks in `eval.js` are regex-level; next steps are an LLM-as-judge for groundedness
-  (every number in the reply appears in a tool result), a larger labeled query set for retrieval recall@k,
-  and a scheduled CI eval with a pass-rate threshold.
-- **Prompt injection** is handled by rules (scope rules, role validation, leak filter); a dedicated classifier would strengthen it.
-- **Caching** of frequent query embeddings and answers.
-- **Data freshness:** run `npm run embed` on catalog change (hash-based, so only changed products are re-embedded).
-- **Compatibility rules** are heuristic over free text; a structured compatibility table in the source data would be better.
-- **Deploys** stop the old backend container before starting the new one (a few seconds of downtime); blue/green would remove it.
-- **Production hardening:** PII detection beyond regex, observability (trace IDs per tool call), A/B on prompts.
-- **Handoff:** escalate to human support when the user is frustrated or the question is out of scope.
