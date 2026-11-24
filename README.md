@@ -228,12 +228,3 @@ so only the most recent logs are kept. Files currently being written are never d
 error rate, p95 latency and ungrounded rate, use an LLM-tracing tool (Langfuse, LangSmith, Helicone or OpenTelemetry GenAI spans)
 for per-step traces, run an LLM-as-judge on a daily sample of interactions, and turn 👎 turns into new eval scenarios.
 
-## Limitations & next steps
-
-- **Evaluation:** checks in `eval.js` are regex-level; next step is an LLM-as-judge for groundedness
-  (every number in the reply appears in a tool result) plus a larger labeled query set for retrieval recall@k.
-- **Streaming** responses (SSE) for perceived latency; **caching** frequent queries.
-- **Data freshness:** run `npm run embed` on catalog change (hash-based, so only changed products are re-embedded).
-- **Compatibility rules** are heuristic over free text; a structured compatibility table in the source data would be better.
-- **Production hardening:** rate limiting, PII scrubbing in logs, observability (trace IDs per tool call), A/B on prompts.
-- **Handoff:** escalate to human support when the user is frustrated or the question is out of scope.
