@@ -9,6 +9,13 @@ import { getLogger, redact, truncate } from '../logger.js';
 
 const logger = getLogger('api');
 
+/**
+ * Make a request body safe and compact for logging.
+ * Chat bodies -> only the message count + the newest message (redacted, max 300 chars);
+ * other bodies -> every string redacted and truncated.
+ * @param {*} body  Parsed JSON body (or undefined)
+ * @returns {*} sanitized copy, e.g. {message_count: 3, last_message: {role: 'user', content: '...'}}
+ */
 function sanitizeBody(body) {
   if (!body || typeof body !== 'object') return body;
   if (Array.isArray(body.messages)) {
@@ -22,6 +29,13 @@ function sanitizeBody(body) {
  * Mount FIRST (before express.json): assigns the request ID and logs completion.
  * If it ran after the body parser, requests with malformed JSON would be rejected before
  * getting an ID and would never appear in requests.log.
+ * Sets `req.id` (from X-Request-Id or a new UUID) and `req.sessionId` (from X-Session-Id),
+ * returns the ID in the X-Request-Id response header, and logs status + duration on finish
+ * (INFO for 2xx/3xx, WARN for 4xx, ERROR for 5xx).
+ * @param {import('express').Request & {id?: string, sessionId?: string|null}} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {void}
  */
 export function requestContext(req, res, next) {
   const start = process.hrtime.bigint();
@@ -39,7 +53,14 @@ export function requestContext(req, res, next) {
   next();
 }
 
-/** Mount AFTER express.json: logs the incoming request including its (sanitized) body. */
+/**
+ * Mount AFTER express.json: logs the incoming request including its (sanitized) body.
+ * Writes one JSON line to logs/requests.*.log: requestId, sessionId, method, url, query, body, ip, userAgent.
+ * @param {import('express').Request & {id?: string, sessionId?: string|null}} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} next
+ * @returns {void}
+ */
 export function logRequests(req, res, next) {
   const { method, originalUrl, query } = req;
   logger.info('Incoming request', {

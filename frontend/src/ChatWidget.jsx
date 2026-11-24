@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { sendChat, sendFeedback, newSession } from './api.js';
+import { streamChat, sendFeedback, newSession, getHealth } from './api.js';
+
+// Friendly status text while a tool runs (shown before the first word of the answer arrives)
+const TOOL_STATUS = {
+  search_products: 'Searching products',
+  get_product_details: 'Looking up product details',
+  compare_products: 'Comparing products',
+  find_compatible_products: 'Checking compatibility',
+  get_catalog_overview: 'Checking the catalog',
+};
 
 const GREETING = {
   role: 'assistant',
@@ -28,29 +37,61 @@ export default function ChatWidget() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [showTrace, setShowTrace] = useState(false);
+  const [health, setHealth] = useState(null);
   const endRef = useRef(null);
+  const abortRef = useRef(null); // AbortController of the in-flight stream (Stop button)
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, loading]);
-  useEffect(() => { try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(messages)); } catch { /* ignore */ } }, [messages]);
+  useEffect(() => { getHealth().then(setHealth).catch(() => setHealth(null)); }, []);
+
+  // 'auto' while streaming: smooth scrolling on every token makes the view jitter
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: loading ? 'auto' : 'smooth' }); }, [messages, loading]);
+  useEffect(() => {
+    // Persist finished messages only (never a half-streamed one)
+    try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(messages.filter((m) => !m.streaming))); } catch { /* ignore */ }
+  }, [messages]);
+
+  /** Update the assistant message that is currently streaming (always the last one). */
+  const patchLast = (fn) => setMessages((ms) => ms.map((m, i) => (i === ms.length - 1 ? { ...m, ...fn(m) } : m)));
 
   async function send(text) {
     const content = text.trim();
     if (!content || loading) return;
-    const next = [...messages, { role: 'user', content }];
-    setMessages(next);
+    const history = [...messages, { role: 'user', content }];
+    // Placeholder assistant message that fills up as tokens arrive
+    setMessages([...history, { role: 'assistant', content: '', streaming: true, status: 'Thinking' }]);
     setInput('');
     setError(null);
     setLoading(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
-      const { requestId, reply, products, trace, ms } = await sendChat(next.filter((m) => !m.isGreeting));
-      setMessages([...next, { role: 'assistant', content: reply, products, trace, ms, requestId }]);
+      const final = await streamChat(history.filter((m) => !m.isGreeting), {
+        onMeta: ({ requestId }) => patchLast(() => ({ requestId })),
+        onToolStart: ({ tool }) => patchLast(() => ({ status: TOOL_STATUS[tool] || 'Working' })),
+        onToolEnd: () => patchLast(() => ({ status: 'Writing the answer' })),
+        onReset: () => patchLast(() => ({ content: '' })),
+        onToken: (delta) => patchLast((m) => ({ content: m.content + delta })),
+      }, controller.signal);
+      // Final payload: authoritative text + product cards + trace
+      patchLast(() => ({ content: final.reply, products: final.products, trace: final.trace, ms: final.ms, requestId: final.requestId, streaming: false, status: null }));
     } catch (e) {
-      setError(e.message);
-      setMessages(messages); // roll back so the user can retry
-      setInput(content);
+      if (controller.signal.aborted) {
+        // Stopped by the user: keep whatever was written so far
+        patchLast((m) => ({ content: m.content ? `${m.content}\n\n_(stopped)_` : '_(stopped)_', streaming: false, status: null }));
+      } else {
+        setError(e.message);
+        setMessages(messages); // roll back so the user can retry
+        setInput(content);
+      }
     } finally {
+      abortRef.current = null;
       setLoading(false);
     }
+  }
+
+  function stop() {
+    abortRef.current?.abort(); // the server sees the disconnect and cancels the OpenAI request
   }
 
   function reset() {
@@ -77,7 +118,14 @@ export default function ChatWidget() {
       <header className="chat-header">
         <div>
           <div className="chat-title">Product Assistant</div>
-          <div className="chat-sub">Answers come from the product catalog</div>
+          <div className="chat-sub">
+            Answers come from the product catalog
+            {showTrace && health && (
+              <span className="store-badge" title={health.vector_store?.note || ''}>
+                {health.semantic_search ? `${health.vector_store.type} · ${health.vector_store.vectors} vectors` : 'keyword search only'}
+              </span>
+            )}
+          </div>
         </div>
         <div className="chat-actions">
           <label className="trace-toggle" title="Show the tool calls behind each answer">
@@ -96,7 +144,6 @@ export default function ChatWidget() {
             {SUGGESTIONS.map((s) => <button key={s} onClick={() => send(s)}>{s}</button>)}
           </div>
         )}
-        {loading && <div className="msg assistant"><div className="bubble typing">Searching the catalog<span>.</span><span>.</span><span>.</span></div></div>}
         {error && <div className="chat-error">⚠️ {error} <button onClick={() => send(input)}>Retry</button></div>}
         <div ref={endRef} />
       </div>
@@ -110,7 +157,9 @@ export default function ChatWidget() {
           disabled={loading}
           autoFocus
         />
-        <button type="submit" disabled={loading || !input.trim()}>Send</button>
+        {loading
+          ? <button type="button" className="stop" onClick={stop}>Stop</button>
+          : <button type="submit" disabled={!input.trim()}>Send</button>}
       </form>
       <div className="chat-disclaimer">AI assistant · prices are MSRP and may vary by retailer</div>
     </section>
@@ -142,21 +191,25 @@ function Feedback({ m, onRate }) {
 function Message({ m, showTrace, onRate }) {
   return (
     <div className={`msg ${m.role}`}>
-      <div className="bubble">
-        {m.role === 'assistant'
-          ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: (p) => <a {...p} target="_blank" rel="noreferrer" /> }}>{m.content}</ReactMarkdown>
-          : m.content}
+      <div className={`bubble${m.streaming ? ' streaming' : ''}`}>
+        {m.role === 'assistant' && m.streaming && !m.content
+          // Before the first token: show what the agent is doing right now
+          ? <span className="typing">{m.status || 'Thinking'}<span>.</span><span>.</span><span>.</span></span>
+          : m.role === 'assistant'
+            ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: (p) => <a {...p} target="_blank" rel="noreferrer" /> }}>{m.content}</ReactMarkdown>
+            : m.content}
       </div>
       {m.products?.length > 0 && (
         <div className="cards">{m.products.map((p) => <ProductCard key={p.model} p={p} />)}</div>
       )}
-      {m.role === 'assistant' && <Feedback m={m} onRate={onRate} />}
+      {m.role === 'assistant' && !m.streaming && <Feedback m={m} onRate={onRate} />}
       {showTrace && m.trace && (
         <div className="trace">
           <div className="trace-head">{m.trace.length ? `${m.trace.length} tool call(s)` : 'No tools used'} · {m.ms} ms</div>
           {m.trace.map((t, i) => (
             <details key={i}>
               <summary><code>{t.tool}</code> → {t.result_preview}</summary>
+              {t.retrieval && <div className="retrieval">{describeRetrieval(t.retrieval)}</div>}
               <pre>{JSON.stringify(t.args, null, 2)}</pre>
             </details>
           ))}
@@ -164,6 +217,15 @@ function Message({ m, showTrace, onRate }) {
       )}
     </div>
   );
+}
+
+function describeRetrieval(r) {
+  if (r.mode === 'filters_only') return 'filters only (no text query)';
+  const v = r.vector || {};
+  const vec = v.used
+    ? `${v.store}: ${v.hits} hits in ${v.search_ms}ms (+${v.embed_ms}ms query embedding), ${v.kept_after_filters} kept after filters`
+    : `vector search off${v.error ? ` (${v.error})` : v.skipped ? ` (${v.skipped})` : ''}`;
+  return `${r.mode} · BM25 ${r.bm25_hits} hits · ${vec}`;
 }
 
 const STATUS_CLASS = { Active: 'ok', 'Temporarily Out of Stock': 'warn', 'Coming Soon': 'info', Discontinued: 'bad' };

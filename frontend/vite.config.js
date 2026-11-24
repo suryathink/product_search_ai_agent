@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// In dev, /api/* is proxied to the Express backend so the browser sees one origin.
+// No dev proxy: the app calls the backend directly at VITE_API_BASE_URL (default http://localhost:3001).
+// The backend allows this origin via its CORS allowlist (CORS_ORIGINS).
 export default defineConfig({
   plugins: [react()],
-  server: { port: 5173, proxy: { '/api': 'http://localhost:3001' } },
+  server: { port: 5173 },
 });

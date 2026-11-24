@@ -7,6 +7,11 @@ import path from 'node:path';
 import { LOG_DIR, shutdownLogger } from '../src/logger.js';
 
 const day = process.argv[2];
+/**
+ * Read all JSON-lines log files of one kind (optionally one day) into objects; skips unparsable lines.
+ * @param {string} prefix  "interactions" or "feedback"
+ * @returns {object[]}
+ */
 const read = (prefix) => fs.readdirSync(LOG_DIR)
   .filter((f) => f.startsWith(`${prefix}.`) && f.endsWith('.log') && (!day || f.includes(day)))
   .flatMap((f) => fs.readFileSync(path.join(LOG_DIR, f), 'utf8').split('\n').filter(Boolean))
@@ -19,10 +24,41 @@ const errors = turns.filter((t) => t.status === 'error');
 const feedback = read('feedback');
 const byId = new Map(ok.map((t) => [t.requestId, t]));
 
+/**
+ * Percentile (nearest-rank).
+ * @param {number[]} arr
+ * @param {number} p  0-100
+ * @returns {number|string} the value, or "-" for an empty list
+ */
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))] : '-'; };
+
+/**
+ * Format a count as a percentage of successful turns.
+ * @param {number} n
+ * @returns {string} e.g. "12.5%"
+ */
 const share = (n) => (ok.length ? `${((n / ok.length) * 100).toFixed(1)}%` : '-');
+
+/**
+ * Count occurrences, most frequent first.
+ * @param {Array<string|number>} xs
+ * @returns {[string, number][]} e.g. [["search_products", 12], ["get_product_details", 5]]
+ */
 const count = (xs) => Object.entries(xs.reduce((m, x) => ((m[x] = (m[x] || 0) + 1), m), {})).sort((a, b) => b[1] - a[1]);
+
+/**
+ * Cut long text for one-line output.
+ * @param {string|undefined} s
+ * @param {number} [n=90]
+ * @returns {string|undefined}
+ */
 const short = (s, n = 90) => (s && s.length > n ? `${s.slice(0, n)}…` : s);
+
+/**
+ * Print a section header like "=== Quality signals ======".
+ * @param {string} t
+ * @returns {void}
+ */
 const h = (t) => console.log(`\n=== ${t} ${'='.repeat(Math.max(0, 60 - t.length))}`);
 
 console.log(`Agent report ${day ? `for ${day}` : '(all logs)'} — ${LOG_DIR}`);
@@ -36,6 +72,11 @@ console.log(`estimated cost: $${cost.toFixed(4)}  (avg $${(cost / ok.length).toF
 console.log(`avg tool calls/turn: ${(ok.reduce((s, t) => s + t.tool_calls.length, 0) / ok.length).toFixed(2)}   tool usage: ${count(ok.flatMap((t) => t.tool_calls.map((c) => c.tool))).map(([k, v]) => `${k}=${v}`).join(', ')}`);
 
 h('Quality signals');
+/**
+ * Select the turns whose quality signals satisfy a predicate.
+ * @param {(signals: object) => *} f  e.g. (s) => s.grounded === false
+ * @returns {object[]} matching interaction records
+ */
 const q = (f) => ok.filter((t) => f(t.signals || {}));
 console.log(`possibly ungrounded answers: ${q((s) => s.grounded === false).length} (${share(q((s) => s.grounded === false).length)})`);
 console.log(`turns with zero-result searches: ${q((s) => s.zero_result_searches).length} (${share(q((s) => s.zero_result_searches).length)})`);

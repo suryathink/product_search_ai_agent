@@ -1,5 +1,5 @@
 // Terminal chat with the agent. Shows the tool calls so you can watch it "think".
-import 'dotenv/config';
+import '../src/configs/index.js'; // loads backend/.env
 import readline from 'node:readline/promises';
 import { chat, MODEL } from '../src/agent.js';
 

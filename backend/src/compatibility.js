@@ -6,14 +6,44 @@
 //   3. Interfaces in specs bit_holder (SDS-plus/SDS-max/hex), collet_in, accessory_interface (Starlock...), pad_diameter_in
 import { catalog, specNumber } from './catalog.js';
 
+/** @typedef {import('./catalog.js').Product} Product */
+
+/**
+ * Compact product view used inside compatibility results.
+ * @typedef {{model: string, name: string, brand: string, subcategory: string, price: number|null, status: string, url: string}} ProductSummary
+ */
+
+/**
+ * Null-safe lower-case, for case-insensitive comparisons.
+ * @param {*} s
+ * @returns {string}
+ */
 const lc = (s) => String(s ?? '').toLowerCase();
+
+/**
+ * Is this product an accessory (bits, blades, sanding, attachments...) rather than a tool?
+ * @param {Product} p
+ * @returns {boolean}
+ */
 const isAccessory = (p) => /accessor|bits|blades|sanding|grinding|cutting|carving|cleaning|attachment|filament/i.test(p.category + ' ' + p.subcategory)
   && !['Power Tools', 'Rotary Tools'].includes(p.category);
+
+/**
+ * Is this product a tool that accessories/batteries can be compatible WITH
+ * (power, rotary, measuring tools, 3D printers...), excluding accessory/consumable subcategories?
+ * @param {Product} p
+ * @returns {boolean}
+ */
 const isTool = (p) => ['Power Tools', 'Rotary Tools', 'Digital Fabrication', 'Measuring Tools'].includes(p.category)
   && !/accessor|filament|tripod|grade rod/i.test(p.subcategory);
 
 // --- 1. Battery platforms -------------------------------------------------------
 // "Dremel 12V / Bosch 12V Max" and "Bosch 12V Max" are interchangeable 12V platforms.
+/**
+ * Reduce a battery-platform text to a comparable key.
+ * @param {string|null|undefined} s  e.g. "Bosch 18V (CORE18V / PROFACTOR compatible)", "Dremel 12V / Bosch 12V Max"
+ * @returns {'18v'|'12v'|null} null when the text names no battery platform
+ */
 function platformKey(s) {
   const t = lc(s);
   if (t.includes('18v')) return '18v';
@@ -22,9 +52,21 @@ function platformKey(s) {
 }
 
 // --- 2. Labels a tool answers to, used to match accessory phrases ---------------
+/**
+ * All the names an accessory's compatibility text might use for this tool.
+ * @param {Product} t  A tool
+ * @returns {string[]} lower-case labels
+ * @example toolLabels(hammerDrillDriver) // -> ['hammer drill/driver', 'drill/driver', 'drill', 'hammer drill']
+ * @example toolLabels(dremel4000Kit)     // -> ['rotary tool', 'dremel 4000']
+ */
 function toolLabels(t) {
   const type = lc(t.productType).replace(/^corded |^cordless /, '');
   const labels = new Set([type]);
+  /**
+   * Add one or more alias labels for this tool.
+   * @param {...string} xs
+   * @returns {void}
+   */
   const add = (...xs) => xs.forEach((x) => labels.add(x));
   if (/drill\/driver/.test(type)) add('drill/driver', 'drill');
   if (/hammer drill/.test(type)) add('hammer drill', 'drill');
@@ -39,7 +81,16 @@ function toolLabels(t) {
   return [...labels];
 }
 
-/** Does an accessory's compatibility phrase apply to this tool? */
+/**
+ * Does one of an accessory's compatibility phrases apply to this tool?
+ * Step 1: the tool's type must appear in the phrase as a whole word (see {@link toolLabels}).
+ * Step 2: interface refinements — SDS-plus vs SDS-max bit holder, collet size, sander pad size,
+ * Starlock interface, brand/voltage prefixes — must also agree.
+ * @param {string} phrase  e.g. "SDS-plus rotary hammers", "Routers with 1/4 in. collet", "Dremel 4000"
+ * @param {Product} t      The tool
+ * @returns {boolean}
+ * @example phraseMatchesTool('SDS-plus rotary hammers', sdsMaxHammer) // false (wrong bit holder)
+ */
 function phraseMatchesTool(phrase, t) {
   const ph = lc(phrase);
   const labels = toolLabels(t);
@@ -74,15 +125,103 @@ function phraseMatchesTool(phrase, t) {
   return true;
 }
 
+/**
+ * Shrink a product to the few fields a compatibility list needs (keeps LLM tokens low).
+ * @param {Product} p
+ * @returns {ProductSummary}
+ */
 const summarize = (p) => ({
   model: p.model, name: p.name, brand: p.brand, subcategory: p.subcategory, price: p.price, status: p.status, url: p.url,
 });
 
+/** Filler words ignored when reading a user's need ("what can I use for engraving glass"). */
+const NEED_STOP = new Set('for the and with what can use using want need something into onto from that this my our a an to of in on it is'.split(' '));
+
 /**
- * Find what works with a given product.
- * Returns groups with an explicit `basis` so the agent can explain WHY something is compatible.
+ * Extract the meaningful words from a need.
+ * @param {string} need  e.g. "what can I use for engraving glass"
+ * @returns {string[]} e.g. ["engraving", "glass"]
  */
-export function findCompatible(p, { limit = 10, activeOnly = true } = {}) {
+const needTerms = (need) => [...new Set(String(need ?? '').toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !NEED_STOP.has(w)))];
+
+// Light stemming + WHOLE-WORD start match: "engraving" -> /\bengrav/ ; "glass" must not match "fiberglass"
+/**
+ * Light stemming: strip "-ing"/"-ed" from longer words so "engraving" also matches "engraver".
+ * @param {string} w
+ * @returns {string} e.g. "engraving" -> "engrav", "glass" -> "glass"
+ */
+const stem = (w) => (w.length > 5 ? w.replace(/(ing|ed)$/, '') : w);
+
+/**
+ * Regex matching a word at a word START, so "glass" matches "glass" but not "fiberglass".
+ * @param {string} w
+ * @returns {RegExp} e.g. /\bengrav/
+ */
+const wordRe = (w) => new RegExp(`\\b${stem(w).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`);
+
+/**
+ * All searchable text of an accessory (name, type, descriptions, features), lower-cased.
+ * @param {Product} a
+ * @returns {string}
+ */
+const accText = (a) => `${a.name} ${a.subcategory} ${a.productType} ${a.shortDescription} ${a.keyFeatures.join(' ')} ${a.longDescription ?? ''}`.toLowerCase();
+
+/**
+ * Rank compatible accessories by the user's need ("engraving glass") and report which need terms
+ * appear in NO compatible accessory. Stating the negative fact explicitly is what stops the model from
+ * claiming "suitable for glass" — prompt rules alone did not.
+ * @param {Product[]} acc   Accessories already known to be compatible with the tool
+ * @param {string} need     What the user wants to do, e.g. "engraving glass"
+ * @returns {null | {
+ *   need: string,
+ *   terms_found_in_compatible_accessories: string[],
+ *   terms_not_found_anywhere: string[],
+ *   best_matches: (ProductSummary & {matched_terms: string[]})[],
+ *   warning?: string
+ * }} null when the need has no meaningful words
+ */
+function matchNeed(acc, need) {
+  const terms = needTerms(need);
+  if (!terms.length) return null;
+  const scored = acc.map((a) => {
+    const t = accText(a);
+    const hit = terms.filter((w) => wordRe(w).test(t));
+    return { a, hit };
+  });
+  const covered = new Set(scored.flatMap((s) => s.hit));
+  const best = scored.filter((s) => s.hit.length).sort((x, y) => y.hit.length - x.hit.length).slice(0, 8);
+  const missing = terms.filter((w) => !covered.has(w));
+  return {
+    need,
+    terms_found_in_compatible_accessories: [...covered],
+    terms_not_found_anywhere: missing,
+    best_matches: best.map(({ a, hit }) => ({ ...summarize(a), matched_terms: hit })),
+    ...(missing.length && {
+      warning: `No compatible accessory's catalog text mentions: ${missing.join(', ')}. Do NOT claim any accessory is made for or suitable for that; say the catalog doesn't specify it.`,
+    }),
+  };
+}
+
+/**
+ * Find what works with a given product. Returns groups with an explicit `basis`
+ * so the agent can explain WHY something is compatible:
+ * - battery / charger -> tools and other batteries on the same platform
+ * - tool              -> batteries/chargers on its platform + accessories whose compatibility text fits it
+ * - accessory         -> tools its compatibility text describes
+ * @param {Product} p
+ * @param {object} [options]
+ * @param {number} [options.limit=10]          Max items listed per group (totals are always complete)
+ * @param {boolean} [options.activeOnly=true]  Only Active / Temporarily Out of Stock products
+ * @param {string} [options.need]              Optional job/material, e.g. "engraving glass" — adds `for_your_need`
+ * @returns {{
+ *   product: ProductSummary,
+ *   listed_compatibility: string[],
+ *   battery_platform: string|null,
+ *   groups: {group: string, basis: string, total: number, items: object[], subcategories?: Record<string, number>, for_your_need?: object}[],
+ *   note: string
+ * }}
+ */
+export function findCompatible(p, { limit = 10, activeOnly = true, need } = {}) {
   const pool = catalog.products.filter((x) => x !== p && (!activeOnly || x.status === 'Active' || x.status === 'Temporarily Out of Stock'));
   const groups = [];
   const platform = platformKey(p.batteryPlatform) || platformKey(p.compatibleWith.join(' '));
@@ -112,6 +251,7 @@ export function findCompatible(p, { limit = 10, activeOnly = true } = {}) {
       group: 'Accessories', basis: 'accessory compatibility text vs. this tool type/interface',
       total: acc.length, subcategories: Object.fromEntries([...bySub].map(([k, v]) => [k, v.length])),
       items: diversified.map((a) => ({ ...summarize(a), listed_compatibility: a.compatibleWith.join(' | ') })),
+      ...(need && { for_your_need: matchNeed(acc, need) }),
     });
   } else {
     // Accessory (or apparel, storage...) -> which tools does it fit?

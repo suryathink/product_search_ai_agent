@@ -3,3 +3,6 @@ dist/
 .env
 data/embeddings.json
 logs/
+
+# Personal interview notes - never commit
+INTERVIEW_PREP.md

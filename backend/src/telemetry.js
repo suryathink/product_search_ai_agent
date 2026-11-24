@@ -2,14 +2,28 @@
 // Ops metrics (latency, errors) tell you the service is UP; these tell you the agent is GOOD.
 import { getLogger, redact, truncate } from './logger.js';
 import { MODEL } from './agent.js';
+import { saveInteraction, saveFeedback } from './mongo.js';
+import { loggingConfig, telemetryConfig } from './configs/index.js';
+
+/**
+ * Write conversation content (interactions + feedback) to local log files?
+ * Default true. In production set INTERACTION_FILE_LOGS=false so user conversations live only in
+ * MongoDB (access-controlled, TTL retention) and not on every server's disk.
+ */
+const FILE_LOGS = loggingConfig.interactionFileLogs;
 
 const interactionLog = getLogger('interaction');
 const feedbackLog = getLogger('feedback');
 const logger = getLogger('telemetry');
 
 // USD per 1M tokens. Defaults are an ESTIMATE for gpt-4.1-mini; set real prices for your model in .env.
-const PRICE_IN = Number(process.env.PRICE_INPUT_PER_1M ?? 0.4);
-const PRICE_OUT = Number(process.env.PRICE_OUTPUT_PER_1M ?? 1.6);
+const PRICE_IN = telemetryConfig.priceInputPer1M;
+const PRICE_OUT = telemetryConfig.priceOutputPer1M;
+/**
+ * Estimate the USD cost of a turn from its token usage (prices from .env, default = gpt-4.1-mini estimate).
+ * @param {{prompt_tokens: number, completion_tokens: number}} u
+ * @returns {number} USD, 6 decimals, e.g. 0.001216
+ */
 export const estimateCost = (u) => +(((u.prompt_tokens * PRICE_IN) + (u.completion_tokens * PRICE_OUT)) / 1e6).toFixed(6);
 
 // ---------------------------------------------------------------------------
@@ -24,20 +38,43 @@ const m = {
   feedback_up: 0, feedback_down: 0, sessions: new Set(),
 };
 
+/**
+ * Percentile of a list of numbers (nearest-rank).
+ * @param {number[]} arr
+ * @param {number} p  0-100, e.g. 95 for p95 latency
+ * @returns {number|null} null for an empty list
+ */
 const pct = (arr, p) => {
   if (!arr.length) return null;
   const s = [...arr].sort((a, b) => a - b);
   return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
 };
+
+/**
+ * Share of turns, rounded to 3 decimals.
+ * @param {number} n  count of turns with some property
+ * @returns {number} n / total turns (0 when there are no turns yet)
+ */
 const rate = (n) => (m.turns ? +(n / m.turns).toFixed(3) : 0);
 
-/** Called once per successful chat turn. */
+/**
+ * Record one successful chat turn: writes the full trace to logs/interactions.*.log (user text redacted)
+ * and updates the in-memory metrics. Called once per turn by the /api/chat route.
+ * @param {object} params
+ * @param {string} params.requestId   Links this record to requests.log and feedback.log
+ * @param {string|null} params.sessionId  Groups turns of one conversation
+ * @param {{role: string, content: string}[]} params.history  Conversation; last item = the user's message
+ * @param {Awaited<ReturnType<typeof import('./agent.js').chat>>} params.result  What chat() returned
+ * @param {number} params.ms          Total turn latency
+ * @returns {void}
+ */
 export function recordInteraction({ requestId, sessionId, history, result, ms }) {
   const { reply, trace, usage, signals, products } = result;
   const cost = estimateCost(usage);
   const userMessage = history.at(-1).content;
 
-  interactionLog.info({
+  // Build the record ONCE, then send it to every destination -> file log and MongoDB can't disagree
+  const record = {
     requestId,
     sessionId,
     model: MODEL,
@@ -45,18 +82,20 @@ export function recordInteraction({ requestId, sessionId, history, result, ms })
     user_message: truncate(redact(userMessage), 2000),
     reply: truncate(reply, 4000),
     products: products.map((p) => p.model),
-    tool_calls: trace.map((t) => ({ step: t.step, tool: t.tool, args: t.args, ms: t.ms, result: t.result_preview, flags: t.flags })),
+    tool_calls: trace.map((t) => ({ step: t.step, tool: t.tool, args: t.args, ms: t.ms, result: t.result_preview, flags: t.flags, ...(t.retrieval && { retrieval: t.retrieval }) })),
     latency_ms: ms,
     llm_ms: usage.llm_ms,
     llm_calls: usage.llm_calls,
     tokens: { prompt: usage.prompt_tokens, completion: usage.completion_tokens },
     cost_usd: cost,
     signals,
-  });
+  };
+  if (FILE_LOGS) interactionLog.info(record);
+  saveInteraction(record); // MongoDB, in the background (no-op if not configured)
 
   m.turns++;
   if (sessionId) m.sessions.add(sessionId);
-  latencies.push(ms); if (latencies.length > 1000) latencies.shift();
+  latencies.push(ms); if (latencies.length > telemetryConfig.latencyWindow) latencies.shift();
   m.tokens_in += usage.prompt_tokens;
   m.tokens_out += usage.completion_tokens;
   m.cost_usd += cost;
@@ -71,18 +110,42 @@ export function recordInteraction({ requestId, sessionId, history, result, ms })
   if (trace.length && !products.length) m.no_product_turns++;
 }
 
+/**
+ * Record a failed chat turn (e.g. OpenAI unavailable) in the interactions log and error count.
+ * @param {{requestId: string, sessionId: string|null, error: Error}} params
+ * @returns {void}
+ */
 export function recordError({ requestId, sessionId, error }) {
   m.errors++;
-  interactionLog.info({ requestId, sessionId, model: MODEL, error: error.message, status: 'error' });
+  const record = { requestId, sessionId, model: MODEL, error: error.message, status: 'error' };
+  if (FILE_LOGS) interactionLog.info(record);
+  saveInteraction(record);
 }
 
-/** Thumbs up/down from the widget, linked to the turn by requestId. */
+/**
+ * Record a 👍/👎 from the chat widget in logs/feedback.*.log (comment redacted) and update satisfaction.
+ * A thumbs-down is also logged as a warning so it shows up in the console.
+ * @param {object} params
+ * @param {string} params.requestId          The answer being rated (from the chat response)
+ * @param {string|null} params.sessionId
+ * @param {'up'|'down'} params.rating
+ * @param {string} [params.comment]          Optional "what was wrong?" text
+ * @returns {void}
+ */
 export function recordFeedback({ requestId, sessionId, rating, comment }) {
   if (rating === 'up') m.feedback_up++; else m.feedback_down++;
-  feedbackLog.info('User feedback', { requestId, sessionId, rating, comment: truncate(redact(comment), 1000) });
+  const fb = { requestId, sessionId, rating, comment: truncate(redact(comment), 1000) };
+  if (FILE_LOGS) feedbackLog.info('User feedback', fb);
+  saveFeedback(fb); // MongoDB: feedback collection + marks the rated turn
   if (rating === 'down') logger.warn(`Thumbs down on request ${requestId}${comment ? `: ${truncate(comment, 120)}` : ''}`);
 }
 
+/**
+ * Live metrics since server start, served by GET /api/metrics.
+ * @returns {{since: string, model: string, traffic: object, latency_ms: {p50: number|null, p95: number|null, max: number|null},
+ *   cost: object, agent_behaviour: object, quality: object, user_feedback: {up: number, down: number, satisfaction: number|null}}}
+ *   quality.* are rates (0-1), e.g. ungrounded_rate = share of turns with a possibly invented price/model
+ */
 export function metricsSnapshot() {
   const fb = m.feedback_up + m.feedback_down;
   return {

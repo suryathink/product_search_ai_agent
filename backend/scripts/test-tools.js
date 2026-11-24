@@ -16,6 +16,11 @@ const cases = [
   ['get_catalog_overview', { category: 'Measuring Tools' }],
 ];
 
+/**
+ * Pretty-print a tool result compactly (drops long descriptions and URLs, max 1400 chars).
+ * @param {object} o
+ * @returns {string}
+ */
 const short = (o) => JSON.stringify(o, (k, v) => (k === 'short_description' || k === 'url' ? undefined : v), 1).slice(0, 1400);
 for (const [name, args] of cases) {
   console.log(`\n=== ${name} ${JSON.stringify(args)}`);

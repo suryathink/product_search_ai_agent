@@ -1,34 +1,146 @@
-import 'dotenv/config'; // must be first: agent.js reads env vars at import time
+// configs/ must be imported first: it loads backend/.env before any other module reads settings
+import { serverConfig, openaiConfig, describeConfig } from './configs/index.js';
 import express from 'express';
 import cors from 'cors';
 import { getLogger, shutdownLogger, LOG_DIR } from './logger.js';
 import { requestContext, logRequests } from './middleware/requestLogger.js';
 import { chat, MODEL } from './agent.js';
 import { catalog } from './catalog.js';
-import { hasEmbeddings } from './search.js';
+import { initVectorStore, vectorStatus } from './vectorstore/index.js';
 import { recordInteraction, recordError, recordFeedback, metricsSnapshot } from './telemetry.js';
+import { initMongo, mongoStatus, closeMongo } from './mongo.js';
 
 const logger = getLogger('server');
 const app = express();
 app.use(requestContext); // first: every request gets an ID + completion log, even if body parsing fails
-app.use(cors({ exposedHeaders: ['X-Request-Id'] }));
-app.use(express.json({ limit: '200kb' }));
+// CORS: the frontend calls the API directly from another origin (e.g. :5173 -> :3001).
+// Default CORS_ORIGINS=* -> any website may call the API. Set a comma-separated list to restrict it.
+app.use(cors({
+  origin: serverConfig.corsOrigins.includes('*') ? '*' : serverConfig.corsOrigins,
+  exposedHeaders: ['X-Request-Id'], // let browser code read the request ID header
+}));
+app.use(express.json({ limit: serverConfig.jsonBodyLimit }));
 app.use(logRequests); // after json(), so the body is parsed and can be logged
 
+/**
+ * GET /api/health — is the service up, and which vector store is serving?
+ * @param {import('express').Request} _req
+ * @param {import('express').Response} res
+ * @returns {void} 200 {ok, model, products, semantic_search, vector_store: {type, vectors, note?}, persistence: {mongodb, db?, note?}}
+ */
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, model: MODEL, products: catalog.products.length, semantic_search: hasEmbeddings() });
+  const v = vectorStatus();
+  const mg = mongoStatus();
+  res.json({
+    ok: true,
+    model: MODEL,
+    products: catalog.products.length,
+    semantic_search: v.ready,
+    vector_store: { type: v.store, vectors: v.count, ...(v.reason && { note: v.reason }) },
+    persistence: { mongodb: mg.connected, ...(mg.db && { db: mg.db }), ...(mg.reason && { note: mg.reason }) },
+  });
 });
 
 // Live agent metrics since server start. In production protect this (auth / internal network only).
+/**
+ * GET /api/metrics — live agent metrics since server start (latency, cost, quality rates, feedback).
+ * @param {import('express').Request} _req
+ * @param {import('express').Response} res
+ * @returns {void} 200 — see metricsSnapshot() in telemetry.js
+ */
 app.get('/api/metrics', (_req, res) => res.json(metricsSnapshot()));
 
-// Stateless: the client sends the visible conversation each time.
-app.post('/api/chat', async (req, res) => {
-  const { messages } = req.body ?? {};
-  const valid = Array.isArray(messages) && messages.length > 0
+const BAD_BODY = 'Body must be { messages: [{role, content}...] } ending with a user message.';
+
+/**
+ * Validate a chat request body.
+ * @param {*} body  Parsed JSON body
+ * @returns {{role: 'user'|'assistant', content: string}[] | null} the messages, or null when invalid
+ */
+function validMessages(body) {
+  const { messages } = body ?? {};
+  const ok = Array.isArray(messages) && messages.length > 0
     && messages.every((m) => ['user', 'assistant'].includes(m?.role) && typeof m.content === 'string')
     && messages.at(-1).role === 'user';
-  if (!valid) return res.status(400).json({ error: 'Body must be { messages: [{role, content}...] } ending with a user message.' });
+  return ok ? messages : null;
+}
+
+// Stateless: the client sends the visible conversation each time.
+/**
+ * POST /api/chat/stream — one chat turn, STREAMED as Server-Sent Events.
+ * Same body as /api/chat. Response is `text/event-stream`; each event is `event: <type>\ndata: <json>\n\n`:
+ *   meta       {requestId}                      first event
+ *   tool_start {tool, args}                     a tool started (UI shows "Searching products…")
+ *   tool_end   {tool, ms, result_preview}       it finished
+ *   token      {delta}                          next piece of the answer text
+ *   reset      {}                               discard text streamed so far (model switched to tools)
+ *   done       {requestId, reply, products, trace, usage, ms}   final result (same fields as /api/chat)
+ *   error      {requestId, error}               something failed; stream ends
+ * If the client disconnects (Stop button / tab closed), the OpenAI request is aborted to save tokens.
+ * @param {import('express').Request & {id: string, sessionId: string|null}} req
+ * @param {import('express').Response} res
+ * @returns {Promise<void>}
+ */
+app.post('/api/chat/stream', async (req, res) => {
+  const messages = validMessages(req.body);
+  if (!messages) return res.status(400).json({ error: BAD_BODY });
+
+  res.status(200).set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform', // no caching / no compression buffering
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no', // tell nginx-style proxies not to buffer the stream
+  });
+  res.flushHeaders();
+
+  /**
+   * Write one SSE event (no-op once the client is gone).
+   * @param {string} event
+   * @param {object} data
+   * @returns {void}
+   */
+  const send = (event, data) => {
+    if (!res.writableEnded && !res.destroyed) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  // 'close' on the RESPONSE before we ended it = the client went away -> abort the LLM call
+  const abort = new AbortController();
+  res.on('close', () => { if (!res.writableEnded) abort.abort(); });
+
+  const t0 = Date.now();
+  send('meta', { requestId: req.id });
+  try {
+    const result = await chat(messages, { requestId: req.id, signal: abort.signal, onEvent: send });
+    const ms = Date.now() - t0;
+    recordInteraction({ requestId: req.id, sessionId: req.sessionId, history: messages, result, ms });
+    logger.info(`[${req.id.slice(0, 8)}] chat (stream) ${ms}ms tools=${result.trace.map((t) => t.tool).join(',') || '-'} grounded=${result.signals.grounded}`);
+    const { reply, products, trace, usage } = result;
+    send('done', { requestId: req.id, reply, products, trace, usage, ms });
+  } catch (e) {
+    if (abort.signal.aborted) {
+      logger.info(`[${req.id.slice(0, 8)}] stream cancelled by client after ${Date.now() - t0}ms`);
+    } else {
+      logger.error(`[${req.id.slice(0, 8)}] chat (stream) failed`, e);
+      recordError({ requestId: req.id, sessionId: req.sessionId, error: e });
+      send('error', { requestId: req.id, error: 'The assistant is temporarily unavailable. Please try again.' });
+    }
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
+});
+
+/**
+ * POST /api/chat — one chat turn.
+ * Body: {messages: [{role: 'user'|'assistant', content: string}, ...]} — must end with a user message.
+ * Runs the agent, records the interaction (logs + metrics) and returns the answer.
+ * @param {import('express').Request & {id: string, sessionId: string|null}} req
+ * @param {import('express').Response} res
+ * @returns {Promise<void>} 200 {requestId, reply, products, trace, usage, ms}
+ *   | 400 invalid body | 500 {requestId, error} when the agent fails (e.g. OpenAI down)
+ */
+app.post('/api/chat', async (req, res) => {
+  const messages = validMessages(req.body);
+  if (!messages) return res.status(400).json({ error: BAD_BODY });
 
   const t0 = Date.now();
   try {
@@ -46,6 +158,13 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // Thumbs up/down from the widget -> logs/feedback.*.log, linked to the answer by requestId
+/**
+ * POST /api/feedback — 👍/👎 on an answer.
+ * Body: {requestId: string, rating: 'up'|'down', comment?: string}
+ * @param {import('express').Request & {sessionId: string|null}} req
+ * @param {import('express').Response} res
+ * @returns {void} 200 {ok: true} | 400 invalid body
+ */
 app.post('/api/feedback', (req, res) => {
   const { requestId, rating, comment } = req.body ?? {};
   if (typeof requestId !== 'string' || !['up', 'down'].includes(rating)) {
@@ -56,6 +175,15 @@ app.post('/api/feedback', (req, res) => {
 });
 
 // Last-resort error handler (e.g. malformed JSON body)
+/**
+ * Express error handler (4 arguments = error middleware). Logs 5xx as ERROR and 4xx as WARN,
+ * and never leaks internal error details to the client for 5xx.
+ * @param {Error & {status?: number, statusCode?: number}} err
+ * @param {import('express').Request & {id?: string}} req
+ * @param {import('express').Response} res
+ * @param {import('express').NextFunction} _next  Required in the signature so Express treats this as an error handler
+ * @returns {void} {requestId, error}
+ */
 app.use((err, req, res, _next) => {
   const status = err.status || err.statusCode || 500;
   if (status >= 500) logger.error(`[${req.id?.slice(0, 8)}] unhandled error`, err);
@@ -63,17 +191,36 @@ app.use((err, req, res, _next) => {
   res.status(status).json({ requestId: req.id, error: status >= 500 ? 'Internal error' : err.message });
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = serverConfig.port;
+logger.info('Configuration', describeConfig()); // safe view: secrets shown only as "set"/"not set"
+// Connect dependencies in parallel before taking traffic. Neither can crash startup:
+// vector store falls back to BM25, MongoDB falls back to log files only.
+await Promise.all([initVectorStore(), initMongo()]);
 const server = app.listen(PORT, () => {
-  logger.info(`Product agent API on http://localhost:${PORT} (model=${MODEL}, products=${catalog.products.length}, semantic_search=${hasEmbeddings()}, logs=${LOG_DIR})`);
-  if (!process.env.OPENAI_API_KEY) logger.warn('OPENAI_API_KEY is not set — /api/chat will fail until it is (see .env.example)');
-});
+  const v = vectorStatus();
+  logger.info(`Product agent API on http://localhost:${PORT} (model=${MODEL}, products=${catalog.products.length}, vector_store=${v.store}, semantic_search=${v.ready}, mongodb=${mongoStatus().connected}, logs=${LOG_DIR})`);
+  if (!openaiConfig.hasApiKey) logger.warn('OPENAI_API_KEY is not set — /api/chat will fail until it is (see .env.example)');
+}); 
 
+/**
+ * Log promise rejections nobody handled (the process keeps running).
+ * @param {unknown} e
+ * @returns {void}
+ */
 process.on('unhandledRejection', (e) => logger.error('Unhandled promise rejection', e));
+/**
+ * Log a crash, flush the log files, then exit with code 1 (a process manager should restart it).
+ * @param {Error} e
+ * @returns {void}
+ */
 process.on('uncaughtException', (e) => { logger.fatal('Uncaught exception', e); shutdownLogger().then(() => process.exit(1)); });
 for (const sig of ['SIGINT', 'SIGTERM']) {
+  /**
+   * Graceful shutdown on Ctrl+C / container stop: stop accepting requests, flush logs, exit 0.
+   * @returns {void}
+   */
   process.on(sig, () => {
     logger.info(`${sig} received, shutting down`);
-    server.close(() => shutdownLogger().then(() => process.exit(0)));
+    server.close(() => closeMongo().then(shutdownLogger).then(() => process.exit(0)));
   });
 }
