@@ -2,9 +2,13 @@
 import { serverConfig, openaiConfig, describeConfig } from './configs/index.js';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import { getLogger, shutdownLogger, LOG_DIR } from './logger.js';
 import { requestContext, logRequests } from './middleware/requestLogger.js';
-import { chat, MODEL } from './agent.js';
+import { MODEL } from './agent.js';
+import { guardedChat, chatBodySchema, feedbackBodySchema, validate } from './guardrails/index.js';
+// Rate limiting temporarily disabled for the demo. To re-enable: restore this import and the 3 route lines marked "RATE LIMIT".
+// import { chatRateLimits, feedbackRateLimit } from './guardrails/index.js';
 import { catalog } from './catalog.js';
 import { initVectorStore, vectorStatus } from './vectorstore/index.js';
 import { recordInteraction, recordError, recordFeedback, metricsSnapshot } from './telemetry.js';
@@ -15,6 +19,8 @@ const app = express();
 // Behind nginx: trust X-Forwarded-For so req.ip (logged per request) is the visitor's real IP
 if (serverConfig.trustProxy) app.set('trust proxy', 1);
 app.use(requestContext); // first: every request gets an ID + completion log, even if body parsing fails
+// helmet: standard security headers (nosniff, no framing, no referrer leaks, hides "X-Powered-By: Express")
+app.use(helmet());
 // CORS: the frontend calls the API directly from another origin (e.g. :5173 -> :3001).
 // Default CORS_ORIGINS=* -> any website may call the API. Set a comma-separated list to restrict it.
 app.use(cors({
@@ -52,19 +58,14 @@ app.get('/api/health', (_req, res) => {
  */
 app.get('/api/metrics', (_req, res) => res.json(metricsSnapshot()));
 
-const BAD_BODY = 'Body must be { messages: [{role, content}...] } ending with a user message.';
-
 /**
- * Validate a chat request body.
- * @param {*} body  Parsed JSON body
- * @returns {{role: 'user'|'assistant', content: string}[] | null} the messages, or null when invalid
+ * Validate a chat body with the zod schema (guardrails/validation.js).
+ * @param {unknown} body
+ * @returns {{messages?: {role: 'user'|'assistant', content: string}[], error?: string}}
  */
-function validMessages(body) {
-  const { messages } = body ?? {};
-  const ok = Array.isArray(messages) && messages.length > 0
-    && messages.every((m) => ['user', 'assistant'].includes(m?.role) && typeof m.content === 'string')
-    && messages.at(-1).role === 'user';
-  return ok ? messages : null;
+function parseChatBody(body) {
+  const v = validate(chatBodySchema, body);
+  return v.ok ? { messages: v.data.messages } : { error: `Invalid request: ${v.error}` };
 }
 
 // Stateless: the client sends the visible conversation each time.
@@ -83,9 +84,10 @@ function validMessages(body) {
  * @param {import('express').Response} res
  * @returns {Promise<void>}
  */
+// RATE LIMIT (disabled for demo): app.post('/api/chat/stream', ...chatRateLimits, async (req, res) => {
 app.post('/api/chat/stream', async (req, res) => {
-  const messages = validMessages(req.body);
-  if (!messages) return res.status(400).json({ error: BAD_BODY });
+  const { messages, error } = parseChatBody(req.body);
+  if (error) return res.status(400).json({ requestId: req.id, error });
 
   res.status(200).set({
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -112,10 +114,10 @@ app.post('/api/chat/stream', async (req, res) => {
   const t0 = Date.now();
   send('meta', { requestId: req.id });
   try {
-    const result = await chat(messages, { requestId: req.id, signal: abort.signal, onEvent: send });
+    const result = await guardedChat(messages, { requestId: req.id, signal: abort.signal, onEvent: send });
     const ms = Date.now() - t0;
     recordInteraction({ requestId: req.id, sessionId: req.sessionId, history: messages, result, ms });
-    logger.info(`[${req.id.slice(0, 8)}] chat (stream) ${ms}ms tools=${result.trace.map((t) => t.tool).join(',') || '-'} grounded=${result.signals.grounded}`);
+    logger.info(`[${req.id.slice(0, 8)}] chat (stream) ${ms}ms tools=${result.trace.map((t) => t.tool).join(',') || '-'} grounded=${result.signals.grounded}${result.signals.guardrail_blocked ? ` blocked=${result.signals.guardrail_blocked}` : ''}`);
     const { reply, products, trace, usage } = result;
     send('done', { requestId: req.id, reply, products, trace, usage, ms });
   } catch (e) {
@@ -140,16 +142,17 @@ app.post('/api/chat/stream', async (req, res) => {
  * @returns {Promise<void>} 200 {requestId, reply, products, trace, usage, ms}
  *   | 400 invalid body | 500 {requestId, error} when the agent fails (e.g. OpenAI down)
  */
+// RATE LIMIT (disabled for demo): app.post('/api/chat', ...chatRateLimits, async (req, res) => {
 app.post('/api/chat', async (req, res) => {
-  const messages = validMessages(req.body);
-  if (!messages) return res.status(400).json({ error: BAD_BODY });
+  const { messages, error } = parseChatBody(req.body);
+  if (error) return res.status(400).json({ requestId: req.id, error });
 
   const t0 = Date.now();
   try {
-    const result = await chat(messages, { requestId: req.id });
+    const result = await guardedChat(messages, { requestId: req.id });
     const ms = Date.now() - t0;
     recordInteraction({ requestId: req.id, sessionId: req.sessionId, history: messages, result, ms });
-    logger.info(`[${req.id.slice(0, 8)}] chat ${ms}ms tools=${result.trace.map((t) => t.tool).join(',') || '-'} grounded=${result.signals.grounded}`);
+    logger.info(`[${req.id.slice(0, 8)}] chat ${ms}ms tools=${result.trace.map((t) => t.tool).join(',') || '-'} grounded=${result.signals.grounded}${result.signals.guardrail_blocked ? ` blocked=${result.signals.guardrail_blocked}` : ''}`);
     const { reply, products, trace, usage } = result;
     res.json({ requestId: req.id, reply, products, trace, usage, ms });
   } catch (e) {
@@ -167,12 +170,12 @@ app.post('/api/chat', async (req, res) => {
  * @param {import('express').Response} res
  * @returns {void} 200 {ok: true} | 400 invalid body
  */
+// RATE LIMIT (disabled for demo): app.post('/api/feedback', feedbackRateLimit, (req, res) => {
 app.post('/api/feedback', (req, res) => {
-  const { requestId, rating, comment } = req.body ?? {};
-  if (typeof requestId !== 'string' || !['up', 'down'].includes(rating)) {
-    return res.status(400).json({ error: 'Body must be { requestId, rating: "up"|"down", comment? }' });
-  }
-  recordFeedback({ requestId, sessionId: req.sessionId, rating, comment: typeof comment === 'string' ? comment : undefined });
+  const v = validate(feedbackBodySchema, req.body);
+  if (!v.ok) return res.status(400).json({ requestId: req.id, error: `Invalid request: ${v.error}` });
+  const { requestId, rating, comment } = v.data;
+  recordFeedback({ requestId, sessionId: req.sessionId, rating, comment });
   res.json({ ok: true });
 });
 

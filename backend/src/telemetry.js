@@ -35,7 +35,7 @@ const m = {
   turns: 0, errors: 0, tokens_in: 0, tokens_out: 0, cost_usd: 0, tool_calls: 0,
   tool_usage: {}, zero_result_turns: 0, not_found_turns: 0, clarifying_turns: 0,
   ungrounded_turns: 0, step_cap_hits: 0, tool_error_turns: 0, no_product_turns: 0,
-  feedback_up: 0, feedback_down: 0, sessions: new Set(),
+  feedback_up: 0, feedback_down: 0, sessions: new Set(), guardrail_blocks: 0, guardrail_reasons: {},
 };
 
 /**
@@ -108,6 +108,11 @@ export function recordInteraction({ requestId, sessionId, history, result, ms })
   if (signals.step_cap_hit) m.step_cap_hits++;
   if (signals.tool_errors) m.tool_error_turns++;
   if (trace.length && !products.length) m.no_product_turns++;
+  if (signals.guardrail_blocked) {
+    m.guardrail_blocks++;
+    const kind = signals.guardrail_blocked.split(':')[0]; // moderation_input | moderation_output | internal_disclosure
+    m.guardrail_reasons[kind] = (m.guardrail_reasons[kind] || 0) + 1;
+  }
 }
 
 /**
@@ -171,6 +176,7 @@ export function metricsSnapshot() {
       tool_error_rate: rate(m.tool_error_turns),
       searched_but_no_product_rate: rate(m.no_product_turns),
     },
+    guardrails: { blocked_turns: m.guardrail_blocks, block_rate: rate(m.guardrail_blocks), by_type: m.guardrail_reasons },
     user_feedback: { up: m.feedback_up, down: m.feedback_down, satisfaction: fb ? +(m.feedback_up / fb).toFixed(3) : null },
   };
 }

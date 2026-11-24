@@ -192,15 +192,33 @@ const impl = {
      * @returns {object} the same object
      */
     const withMeta = (obj) => Object.defineProperty(obj, '_meta', { value: { retrieval }, enumerable: false });
+
+    // If the MODEL chose a status filter (e.g. only "Active"), it can hide exactly what the user asked about
+    // ("Is the 6 Ah battery available?" -> it's Coming Soon). Report close matches with other statuses too.
+    // Keyword-only lookup: no extra embedding/Qdrant call.
+    let otherStatuses = null;
+    if (args.status && query.trim()) {
+      const wanted = new Set([args.status].flat().map((s) => String(s).toLowerCase()));
+      const shown = new Set(results.map((p) => p.model));
+      const alt = await searchProducts({ query, filters: { ...filters, status: undefined }, limit: 5, useVectors: false });
+      const extra = alt.results.filter((p) => !wanted.has(p.status.toLowerCase()) && !shown.has(p.model)).slice(0, 3);
+      if (extra.length) otherStatuses = extra.map(summary);
+    }
+    const otherNote = otherStatuses && {
+      also_matching_other_statuses: otherStatuses,
+      status_note: 'These match the request but were excluded by your status filter. If the user asked about one of them, say its real status (e.g. Coming Soon, Discontinued + replacement) instead of saying it is not in the catalog.',
+    };
+
     if (!results.length) {
       return withMeta({
         total_matches: 0,
         message: 'No products match ALL of these constraints.',
         ...(relaxations?.length && { if_you_drop_one_filter: relaxations }),
+        ...otherNote,
         hint: 'Explain which constraint is blocking, offer the closest alternative (and ask whether to relax it). Check cheapest_examples: they may be a DIFFERENT product type than requested — if so, say the requested type does not exist with the other constraints. Do not invent products.',
       });
     }
-    return withMeta({ total_matches: total, showing: results.length, results: results.map(summary) });
+    return withMeta({ total_matches: total, showing: results.length, results: results.map(summary), ...otherNote });
   },
 
   /**

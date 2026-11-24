@@ -11,8 +11,9 @@ import { vectorStoreConfig } from './vectorStore.config.js';
 import { mongoConfig } from './mongo.config.js';
 import { loggingConfig } from './logging.config.js';
 import { telemetryConfig } from './telemetry.config.js';
+import { guardrailsConfig } from './guardrails.config.js';
 
-export { paths, serverConfig, openaiConfig, agentConfig, searchConfig, vectorStoreConfig, mongoConfig, loggingConfig, telemetryConfig };
+export { paths, serverConfig, openaiConfig, agentConfig, searchConfig, vectorStoreConfig, mongoConfig, loggingConfig, telemetryConfig, guardrailsConfig };
 export { ENV_FILE, cliFlag } from './env.js';
 
 /**
@@ -28,6 +29,7 @@ export const config = {
   mongo: mongoConfig,
   logging: loggingConfig,
   telemetry: telemetryConfig,
+  guardrails: guardrailsConfig,
 };
 
 /**
@@ -45,5 +47,9 @@ export function describeConfig() {
     mongo: { uri: mongoConfig.uri ? 'set' : 'not set', db: mongoConfig.dbName, ttlDays: mongoConfig.ttlDays },
     logging: { level: loggingConfig.level, dir: loggingConfig.dir, interactionFileLogs: loggingConfig.interactionFileLogs },
     agent: agentConfig,
+    guardrails: {
+      rateLimit: guardrailsConfig.rateLimit.enabled ? `${guardrailsConfig.rateLimit.perMinute}/min, ${guardrailsConfig.rateLimit.perDay}/day per IP` : 'off',
+      moderation: guardrailsConfig.moderation.enabled ? `${guardrailsConfig.moderation.model} (input${guardrailsConfig.moderation.checkOutput ? ' + output' : ''})` : 'off',
+    },
   };
 }
