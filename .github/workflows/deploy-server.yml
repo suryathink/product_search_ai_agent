@@ -1,0 +1,117 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - "data/bosch_product_catalog_mock.csv"
+      - "deploy/Dockerfile.backend"
+      - "deploy/deploy-server.sh"
+      - ".github/workflows/deploy-server.yml"
+  # Allows a manual re-deploy from the Actions tab
+  workflow_dispatch:
+
+# Never run two deploys at the same time
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  IMAGE: suryathink/product-search-agent-server
+
+jobs:
+  test:
+    name: Smoke-test Tools (no LLM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: backend
+        run: npm ci
+
+      # Loads the catalog and runs every tool against it (BM25 only, no API keys needed).
+      # A crash in data loading, search or compatibility stops the deploy here.
+      - name: Run Tool Tests
+        working-directory: backend
+        env:
+          MONGO_URI: ""
+          VECTOR_STORE: local
+        run: npm run test:tools > /dev/null
+
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log into Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Build context is the repo root: the image needs backend/ AND the catalog in data/
+      - name: Build and Push Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.backend
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        env:
+          DROPLET_SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          DROPLET_KNOWN_HOSTS: ${{ secrets.DROPLET_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DROPLET_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "$DROPLET_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy New Image
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "${DROPLET_USER}@${DROPLET_HOST}" \
+            'bash -s' -- "${IMAGE}:sha-${GITHUB_SHA}" < deploy/deploy-server.sh
+
+      - name: Check Public Health Endpoint
+        env:
+          API_DOMAIN: ${{ vars.API_DOMAIN }}
+        run: |
+          if [ -z "$API_DOMAIN" ]; then echo "API_DOMAIN repository variable not set - skipping public check"; exit 0; fi
+          curl -fsS --retry 5 --retry-delay 3 "https://${API_DOMAIN}/api/health"
+
+      - name: Remove SSH Key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

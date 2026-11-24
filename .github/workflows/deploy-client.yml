@@ -1,0 +1,80 @@
+name: Deploy Frontend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - "deploy/deploy-client.sh"
+      - ".github/workflows/deploy-client.yml"
+  # Allows a manual re-deploy from the Actions tab
+  workflow_dispatch:
+
+# Never run two deploys at the same time
+concurrency:
+  group: deploy-frontend
+  cancel-in-progress: false
+
+env:
+  # Repository variables (Settings -> Secrets and variables -> Actions -> Variables)
+  API_DOMAIN: ${{ vars.API_DOMAIN }}
+  APP_DOMAIN: ${{ vars.APP_DOMAIN }}
+
+jobs:
+  deploy:
+    name: Build and Deploy to VPS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Configuration
+        run: |
+          [ -n "$API_DOMAIN" ] || { echo "Set repository variable API_DOMAIN (e.g. api.example.com)"; exit 1; }
+          [ -n "$APP_DOMAIN" ] || { echo "Set repository variable APP_DOMAIN (e.g. app.example.com)"; exit 1; }
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # The browser calls the API directly, so its URL is baked into the build. A broken build stops the deploy here.
+      - name: Build
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: https://${{ vars.API_DOMAIN }}
+        run: npm run build
+
+      - name: Package Build
+        run: tar -czf client-${GITHUB_SHA}.tar.gz -C frontend/dist .
+
+      - name: Set up SSH
+        env:
+          DROPLET_SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          DROPLET_KNOWN_HOSTS: ${{ secrets.DROPLET_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DROPLET_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "$DROPLET_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Upload and Release
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+        run: |
+          scp -i ~/.ssh/deploy_key client-${GITHUB_SHA}.tar.gz \
+            "${DROPLET_USER}@${DROPLET_HOST}:/tmp/client-${GITHUB_SHA}.tar.gz"
+          ssh -i ~/.ssh/deploy_key "${DROPLET_USER}@${DROPLET_HOST}" \
+            'bash -s' -- "${GITHUB_SHA}" "${APP_DOMAIN}" < deploy/deploy-client.sh
+
+      - name: Remove SSH Key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

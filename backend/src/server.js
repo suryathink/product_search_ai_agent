@@ -12,6 +12,8 @@ import { initMongo, mongoStatus, closeMongo } from './mongo.js';
 
 const logger = getLogger('server');
 const app = express();
+// Behind nginx: trust X-Forwarded-For so req.ip (logged per request) is the visitor's real IP
+if (serverConfig.trustProxy) app.set('trust proxy', 1);
 app.use(requestContext); // first: every request gets an ID + completion log, even if body parsing fails
 // CORS: the frontend calls the API directly from another origin (e.g. :5173 -> :3001).
 // Default CORS_ORIGINS=* -> any website may call the API. Set a comma-separated list to restrict it.
@@ -196,7 +198,7 @@ logger.info('Configuration', describeConfig()); // safe view: secrets shown only
 // Connect dependencies in parallel before taking traffic. Neither can crash startup:
 // vector store falls back to BM25, MongoDB falls back to log files only.
 await Promise.all([initVectorStore(), initMongo()]);
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, serverConfig.host, () => {
   const v = vectorStatus();
   logger.info(`Product agent API on http://localhost:${PORT} (model=${MODEL}, products=${catalog.products.length}, vector_store=${v.store}, semantic_search=${v.ready}, mongodb=${mongoStatus().connected}, logs=${LOG_DIR})`);
   if (!openaiConfig.hasApiKey) logger.warn('OPENAI_API_KEY is not set — /api/chat will fail until it is (see .env.example)');

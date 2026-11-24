@@ -1,0 +1,4 @@
+# Everything is stored and checked out with LF (scripts and configs run on Linux; CRLF breaks bash)
+* text=auto eol=lf
+*.png binary
+*.ico binary

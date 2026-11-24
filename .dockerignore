@@ -1,0 +1,9 @@
+# Keep secrets, local data and build output out of Docker images
+**/node_modules
+**/.env
+**/logs
+frontend/dist
+data/embeddings.json
+.git
+INTERVIEW_PREP.md
+examples

@@ -1,12 +1,19 @@
 // HTTP server settings.
-import { num, str } from './env.js';
+import { bool, num, str } from './env.js';
 
 /**
- * @type {{port: number, jsonBodyLimit: string, corsOrigins: string[]}}
+ * @type {{port: number, host: string, trustProxy: boolean, jsonBodyLimit: string, corsOrigins: string[]}}
  */
 export const serverConfig = {
   /** Port the API listens on. Env: PORT */
   port: num('PORT', 3001),
+  /** Network interface to listen on. 0.0.0.0 = all (needed inside Docker). Env: HOST */
+  host: str('HOST', '0.0.0.0'),
+  /**
+   * Running behind a reverse proxy (nginx)? Then trust its X-Forwarded-* headers so req.ip is the
+   * visitor's IP, not nginx's. Set true in production behind nginx. Env: TRUST_PROXY
+   */
+  trustProxy: bool('TRUST_PROXY', false),
   /**
    * Browser origins allowed to call the API (CORS). Default "*" = allow access from everywhere.
    * To restrict, set a comma-separated list. Env: CORS_ORIGINS

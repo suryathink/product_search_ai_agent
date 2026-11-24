@@ -1,0 +1,35 @@
+# nginx site for the React frontend on the VPS.  __APP_DOMAIN__ is replaced by setup-vps.sh.
+# "current" is a symlink to the live release, switched by deploy-client.sh.
+# certbot adds the HTTPS (443) block and the http->https redirect.
+
+server {
+  listen 80;
+  listen [::]:80;
+  server_name __APP_DOMAIN__;
+
+  root /var/www/__APP_DOMAIN__/current;
+  index index.html;
+
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+  # Hashed build assets never change, so cache them for a year
+  location /assets/ {
+    expires 1y;
+    add_header Cache-Control "public, immutable";
+    try_files $uri =404;
+  }
+
+  # Always revalidate the entry page so new deploys show up immediately
+  location = /index.html {
+    add_header Cache-Control "no-cache";
+  }
+
+  # SPA fallback
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  gzip on;
+  gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+}

@@ -140,6 +140,18 @@ At this size local is faster. Qdrant pays off with scale, multiple instances and
 | Prompt injection / fake discounts | Ignored; prices only from catalog |
 | Follow-ups ("which of those is lighter?") | Conversation history carries model numbers forward |
 
+## Deployment
+
+- **Frontend:** https://bosch-agent.suryathink.com
+- **Backend API:** https://bosch-agent.api.suryathink.com ([/api/health](https://bosch-agent.api.suryathink.com/api/health))
+
+**CI/CD:** every push to `main` deploys the part that changed to a DigitalOcean droplet behind nginx with Let's Encrypt HTTPS:
+- The **backend** is smoke-tested, built into a Docker image, pushed to Docker Hub, then swapped in on the server with a health check and automatic rollback.
+- The **frontend** is built with the production API URL and released atomically, keeping the last 5 releases.
+
+The workflows are in `.github/workflows/`. One-time setup, secrets and operations are in [deploy/DEPLOY.md](deploy/DEPLOY.md).
+The backend runs on port **3001** both locally and in production (on `127.0.0.1` behind nginx); the frontend dev server uses **5173**.
+
 ## Streaming responses
 
 The widget uses `POST /api/chat/stream`, which streams the answer as Server-Sent Events (`text/event-stream`):
