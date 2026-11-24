@@ -302,6 +302,7 @@ function rrf(lists, k = searchConfig.rrfK) {
  * @param {SearchFilters} [params.filters={}]   Hard constraints
  * @param {'relevance'|'price_asc'|'price_desc'|'rating'} [params.sort='relevance']
  * @param {number} [params.limit=8]             Max results returned
+ * @param {boolean} [params.useVectors=true]    false = keyword (BM25) ranking only, no embedding/Qdrant call
  * @returns {Promise<{
  *   results: Product[],
  *   total: number,
@@ -310,7 +311,7 @@ function rrf(lists, k = searchConfig.rrfK) {
  *   retrieval: {mode: 'hybrid'|'bm25_only'|'filters_only'|'no_candidates', bm25_hits?: number, vector?: object}
  * }>} `total` counts all matches; `retrieval` describes how the ranking was produced (for tracing)
  */
-export async function searchProducts({ query = '', filters = {}, sort = 'relevance', limit = searchConfig.defaultLimit }) {
+export async function searchProducts({ query = '', filters = {}, sort = 'relevance', limit = searchConfig.defaultLimit, useVectors = true }) {
   const candidates = applyFilters(filters);
 
   // Zero results: tell the agent WHICH constraint is blocking, so it can explain + offer alternatives
@@ -338,7 +339,8 @@ export async function searchProducts({ query = '', filters = {}, sort = 'relevan
   let retrieval = { mode: 'filters_only' };
   if (query.trim()) {
     const lex = bm25Scores(query, candidates);
-    const { scores: vec, meta } = await vectorScores(query, candidates, filters);
+    // useVectors=false: keyword-only (cheap secondary lookups — no embedding call, no Qdrant query)
+    const { scores: vec, meta } = useVectors ? await vectorScores(query, candidates, filters) : { scores: new Map(), meta: { used: false, skipped: 'keyword-only lookup' } };
     // Only keep semantically-close items from the vector side so it can't flood junk in
     const vecTop = new Map([...vec.entries()].sort((a, b) => b[1] - a[1]).slice(0, searchConfig.vectorKeep));
     const fused = rrf([lex, vecTop].filter((m) => m.size));

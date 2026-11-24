@@ -3,9 +3,13 @@
 A website chat agent that answers product questions (discovery, specs, comparisons, compatibility, status)
 for Bosch, Dremel, RotoZip and CST/berger, grounded in `data/bosch_product_catalog_mock.csv` (2,261 products).
 
-- **Backend:** Node.js + Express, OpenAI tool calling (Chat Completions), in-memory catalog, hybrid search
+**Live:** https://bosch-agent.suryathink.com · API https://bosch-agent.api.suryathink.com ([health](https://bosch-agent.api.suryathink.com/api/health))
+
+- **Backend:** Node.js + Express, OpenAI tool calling (Chat Completions) with streamed answers, in-memory catalog,
+  hybrid search (BM25 + vectors in Qdrant Cloud), MongoDB Atlas persistence, layered guardrails
 - **Frontend:** React (Vite) chat widget embedded on a stand-in storefront page
-- **CLI** and a **scenario eval runner** that produces the example conversations
+- **CLI** and a **20-scenario eval runner** that produces the example conversations
+- **CI/CD:** GitHub Actions → Docker Hub → DigitalOcean droplet behind nginx + HTTPS
 
 ## Run it
 
@@ -34,10 +38,13 @@ npm run eval                  # run all scenarios -> examples/conversations.md
 ## Architecture
 
 ```
-React widget ──POST /api/chat {messages}──► Express (stateless)
-                                             │
-                                             ▼
-                        agent.js — LLM tool-calling loop (≤6 rounds, temp 0.2)
+React widget ──POST /api/chat/stream {messages}──► Express (stateless): helmet · zod validation · (rate limit)
+                                                    │
+                                                    ▼
+                       guardrails/ — OpenAI Moderation on input → agent → leak filter + Moderation on output
+                                                    │
+                                                    ▼
+                        agent.js — LLM tool-calling loop (≤6 rounds, temp 0.2, streamed over SSE)
                                              │ calls
                                              ▼
    tools.js: search_products · get_product_details · compare_products · find_compatible_products · get_catalog_overview
@@ -62,8 +69,11 @@ React widget ──POST /api/chat {messages}──► Express (stateless)
 | `backend/src/compatibility.js` | Deterministic compatibility: battery platform, bit holder / collet / Starlock interface, listed compatibility text |
 | `backend/src/tools.js` | Tool schemas the model sees + implementations returning compact grounded JSON |
 | `backend/src/agent.js` | System prompt (grounding, clarification, status, scope rules) + agent loop + product-card extraction |
-| `backend/scripts/eval.js` | 17 scripted scenarios with automatic checks; writes transcripts with tool traces |
-| `frontend/src/ChatWidget.jsx` | Chat UI, product cards, status badges, "How I found this" tool trace |
+| `backend/src/guardrails/` | `guardedChat()` (moderation around the agent), zod request schemas, rate limiters |
+| `backend/src/server.js` | Routes (`/api/chat`, `/api/chat/stream`, `/api/feedback`, `/api/health`, `/api/metrics`), helmet, CORS, startup/shutdown |
+| `backend/scripts/eval.js` | 20 scripted scenarios with automatic checks, run through `guardedChat()`; writes transcripts with tool traces |
+| `frontend/src/ChatWidget.jsx` | Chat UI, streamed answers, live tool status, Stop button, product cards, status badges, "How I found this" trace |
+| `.github/workflows/`, `deploy/` | CI/CD workflows, Dockerfile, deploy scripts (health check + rollback, atomic frontend release), nginx templates |
 
 ## Key design decisions
 
@@ -152,6 +162,25 @@ At this size local is faster. Qdrant pays off with scale, multiple instances and
 The workflows are in `.github/workflows/`. One-time setup, secrets and operations are in [deploy/DEPLOY.md](deploy/DEPLOY.md).
 The backend runs on port **3001** both locally and in production (on `127.0.0.1` behind nginx); the frontend dev server uses **5173**.
 
+## Guardrails
+
+Layered, using established libraries, and enforced in code rather than only in the prompt. The eval showed the model sometimes ignores prompt-only rules.
+
+| Layer | Guardrail | Library / mechanism |
+|---|---|---|
+| HTTP | Security headers (nosniff, frame denial, HSTS, no `X-Powered-By`) | `helmet` |
+| HTTP | Per-IP rate limits: 15 chat requests/min and 300/day (protects the OpenAI bill). **Currently not mounted (demo period);** re-enable in `server.js` (lines marked `RATE LIMIT`) | `express-rate-limit` |
+| Request | Schema validation: only `user`/`assistant` roles (blocks injected `system` messages), max 40 messages, 1,000 characters per user message, last message from the user | `zod` |
+| Input | Harmful-content check on the user's message; flagged messages are refused **before** the agent runs (no tokens spent) | OpenAI Moderation API (`omni-moderation-latest`, free) |
+| Agent | Scope rules, read-only tools, enum-restricted and validated tool arguments, max 6 tool rounds | system prompt + `tools.js` |
+| Output | Internal-details filter: tool names, prompt and infrastructure never reach the user | `detectInternalLeak` in `agent.js` |
+| Output | Harmful-content check on the final answer (streaming: the text is cleared and replaced) | OpenAI Moderation API |
+| Output | Groundedness signals; product cards only for products a tool returned | `agent.js` |
+
+- Blocked turns are logged, stored in MongoDB with `signals.guardrail_blocked`, and counted in `/api/metrics` (`guardrails.by_type`).
+- The eval runs through the same `guardedChat()` as production, with scenarios for a harmful request (must be blocked), a violent-sounding but legitimate question (must **not** be blocked), internal-disclosure probes, and prompt injection.
+- Settings are in `backend/src/configs/guardrails.config.js` and `.env`.
+
 ## Streaming responses
 
 The widget uses `POST /api/chat/stream`, which streams the answer as Server-Sent Events (`text/event-stream`):
@@ -230,10 +259,15 @@ for per-step traces, run an LLM-as-judge on a daily sample of interactions, and 
 
 ## Limitations & next steps
 
-- **Evaluation:** checks in `eval.js` are regex-level; next step is an LLM-as-judge for groundedness
-  (every number in the reply appears in a tool result) plus a larger labeled query set for retrieval recall@k.
-- **Streaming** responses (SSE) for perceived latency; **caching** frequent queries.
+- **Rate limiting** is implemented but currently not mounted; re-enable it, and add per-session token budgets and auth on `/api/metrics`.
+- **Conversation history** is sent by the browser each turn; loading it server-side from MongoDB by session would stop forged turns.
+- **Evaluation:** checks in `eval.js` are regex-level; next steps are an LLM-as-judge for groundedness
+  (every number in the reply appears in a tool result), a larger labeled query set for retrieval recall@k,
+  and a scheduled CI eval with a pass-rate threshold.
+- **Prompt injection** is handled by rules (scope rules, role validation, leak filter); a dedicated classifier would strengthen it.
+- **Caching** of frequent query embeddings and answers.
 - **Data freshness:** run `npm run embed` on catalog change (hash-based, so only changed products are re-embedded).
 - **Compatibility rules** are heuristic over free text; a structured compatibility table in the source data would be better.
-- **Production hardening:** rate limiting, PII scrubbing in logs, observability (trace IDs per tool call), A/B on prompts.
+- **Deploys** stop the old backend container before starting the new one (a few seconds of downtime); blue/green would remove it.
+- **Production hardening:** PII detection beyond regex, observability (trace IDs per tool call), A/B on prompts.
 - **Handoff:** escalate to human support when the user is frustrated or the question is out of scope.
